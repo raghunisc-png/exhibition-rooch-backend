@@ -1,8 +1,15 @@
+"""
+Main FastAPI application.
+"""
+
+from __future__ import annotations
+
 import logging
 from pathlib import Path
 
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,10 +20,19 @@ from app.routers import auth, invoices, sync
 
 
 # ============================================================
-# CONFIG
+# LOGGING
 # ============================================================
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+)
+
+logger = logging.getLogger("invoice_api")
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 settings = get_settings()
 
@@ -58,8 +74,27 @@ app.include_router(sync.router)
 
 
 # ============================================================
-# PYDANTIC VALIDATION ERROR HANDLER
+# VALIDATION ERROR HANDLERS
 # ============================================================
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    """
+    Return clean FastAPI validation errors as JSON.
+    """
+
+    errors = exc.errors()
+
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": jsonable_encoder(errors),
+        },
+    )
+
 
 @app.exception_handler(ValidationError)
 async def pydantic_validation_handler(
@@ -67,15 +102,12 @@ async def pydantic_validation_handler(
     exc: ValidationError,
 ):
     """
-    Endpoints that manually build Pydantic models inside the
-    function body, such as the multipart invoice-create
-    endpoint, can raise a raw Pydantic ValidationError.
-
-    Convert it to a 422 response that the frontend can consume.
+    Handle Pydantic ValidationError exceptions raised manually
+    inside endpoint/service code.
     """
 
     raw_errors = exc.errors(
-        include_url=False
+        include_url=False,
     )
 
     for error in raw_errors:
@@ -84,9 +116,7 @@ async def pydantic_validation_handler(
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
-            "detail": jsonable_encoder(
-                raw_errors
-            )
+            "detail": jsonable_encoder(raw_errors),
         },
     )
 
@@ -99,7 +129,7 @@ if settings.STORAGE_BACKEND == "local":
 
     upload_dir = Path(
         settings.UPLOAD_DIR
-    )
+    ).resolve()
 
     upload_dir.mkdir(
         parents=True,
@@ -109,7 +139,7 @@ if settings.STORAGE_BACKEND == "local":
     app.mount(
         "/files",
         StaticFiles(
-            directory=str(upload_dir)
+            directory=str(upload_dir),
         ),
         name="files",
     )
@@ -120,7 +150,46 @@ if settings.STORAGE_BACKEND == "local":
 # ============================================================
 
 @app.get("/health")
-def health():
+def health() -> dict[str, str]:
+    """
+    Basic health check.
+    """
+
     return {
-        "status": "ok"
+        "status": "ok",
     }
+
+
+# ============================================================
+# DEBUG ROUTES
+# ============================================================
+
+@app.get("/api/debug/routes")
+def debug_routes() -> list[dict[str, str]]:
+    """
+    Show every route currently registered in FastAPI.
+
+    Development/debugging endpoint.
+    """
+
+    routes = []
+
+    for route in app.routes:
+
+        methods = getattr(
+            route,
+            "methods",
+            None,
+        )
+
+        routes.append(
+            {
+                "path": route.path,
+                "methods": ",".join(
+                    sorted(methods or [])
+                ),
+                "name": route.name,
+            }
+        )
+
+    return routes

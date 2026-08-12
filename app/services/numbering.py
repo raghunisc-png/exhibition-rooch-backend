@@ -5,14 +5,8 @@ Format:
 
     INV-YYYYMMDD-####
 
-Examples:
-
-    INV-20260810-0001
-    INV-20260810-0002
-    INV-20260810-0003
-
-The invoice number is unique because `invoices.invoice_number`
-has a database-level unique constraint.
+The database unique constraint on invoice_number remains the
+final protection against duplicate invoice numbers.
 """
 
 from __future__ import annotations
@@ -25,45 +19,20 @@ from sqlalchemy.orm import Session
 from app.models import Invoice
 
 
-# ============================================================
-# INVOICE NUMBER
-# ============================================================
-
-
 def generate_invoice_number(
     db: Session,
 ) -> str:
     """
-    Generate the next human-friendly invoice number for today.
+    Generate the next invoice number for today.
 
-    Format:
-
-        INV-YYYYMMDD-####
-
-    The sequence is calculated from the number of invoices
-    already created for the current day.
-
-    Example:
-
-        Existing:
-            INV-20260810-0001
-            INV-20260810-0002
-
-        New:
-            INV-20260810-0003
+    This function calculates the next number based on existing
+    invoices. The unique database constraint remains the final
+    concurrency protection.
     """
-
-    # --------------------------------------------------------
-    # Today's prefix
-    # --------------------------------------------------------
 
     today_prefix = (
         f"INV-{datetime.utcnow():%Y%m%d}-"
     )
-
-    # --------------------------------------------------------
-    # Count today's invoices
-    # --------------------------------------------------------
 
     count_today = (
         db.query(
@@ -77,10 +46,6 @@ def generate_invoice_number(
         .scalar()
         or 0
     )
-
-    # --------------------------------------------------------
-    # Generate next number
-    # --------------------------------------------------------
 
     return (
         f"{today_prefix}"

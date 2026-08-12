@@ -1,8 +1,9 @@
-"""add invoice items and update invoice structure
+"""
+Fix invoice schema.
 
 Revision ID: 0002
 Revises: 0001
-Create Date: 2026-08-10
+Create Date: 2026-08-11
 """
 
 from alembic import op
@@ -14,9 +15,23 @@ import sqlalchemy as sa
 # ============================================================
 
 revision = "0002"
+
 down_revision = "0001"
+
 branch_labels = None
+
 depends_on = None
+
+
+# ============================================================
+# ENUMS
+# ============================================================
+
+payment_mode = sa.Enum(
+    "online",
+    "cash",
+    name="payment_mode",
+)
 
 
 # ============================================================
@@ -25,98 +40,121 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # --------------------------------------------------------
-    # 1. Make customer phone optional
-    # --------------------------------------------------------
+    """
+    Upgrade invoice schema.
 
+    Adds:
+
+        1. payment_mode
+        2. gst_enabled
+        3. grand_total
+
+    Existing invoices are preserved.
+
+    Existing invoices receive:
+
+        payment_mode = online
+        gst_enabled = false
+        grand_total = 0.00
+
+    The actual grand_total for old invoices can later be
+    recalculated from their invoice items.
+    """
+
+    bind = op.get_bind()
+
+    # ========================================================
+    # PAYMENT MODE ENUM
+    # ========================================================
+
+    # PostgreSQL enum does not exist yet.
+    payment_mode.create(
+        bind,
+        checkfirst=True,
+    )
+
+    # ========================================================
+    # PAYMENT MODE
+    # ========================================================
+
+    op.add_column(
+        "invoices",
+        sa.Column(
+            "payment_mode",
+            payment_mode,
+            nullable=False,
+            server_default="online",
+        ),
+    )
+
+    # Remove server default after existing rows have
+    # received the value.
     op.alter_column(
         "invoices",
-        "customer_phone",
-        existing_type=sa.String(length=20),
-        nullable=True,
+        "payment_mode",
+        server_default=None,
     )
 
-    # --------------------------------------------------------
-    # 2. Remove old single-product fields
-    #
-    # The old database stored:
-    #
-    # product_name
-    # quantity
-    # unit_price
-    #
-    # These are no longer used because every invoice can now
-    # contain multiple individually priced items.
-    # --------------------------------------------------------
+    # ========================================================
+    # GST ENABLED
+    # ========================================================
 
-    op.drop_column(
+    """
+    Store whether GST was enabled for this invoice.
+
+    Existing invoices are assumed to have GST disabled.
+    """
+
+    op.add_column(
         "invoices",
-        "product_name",
+        sa.Column(
+            "gst_enabled",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.false(),
+        ),
     )
 
-    op.drop_column(
+    # Remove server default after existing rows have
+    # received the value.
+    op.alter_column(
         "invoices",
-        "quantity",
+        "gst_enabled",
+        server_default=None,
     )
 
-    op.drop_column(
+    # ========================================================
+    # GRAND TOTAL
+    # ========================================================
+
+    """
+    Persist the final customer payable amount.
+
+    Existing invoices are initialized to 0.00.
+
+    New invoice creation will calculate and store the actual
+    grand total.
+    """
+
+    op.add_column(
         "invoices",
-        "unit_price",
-    )
-
-    # --------------------------------------------------------
-    # 3. Create invoice_items table
-    # --------------------------------------------------------
-
-    op.create_table(
-        "invoice_items",
-
         sa.Column(
-            "id",
-            sa.Integer(),
-            primary_key=True,
-        ),
-
-        sa.Column(
-            "invoice_id",
-            sa.Integer(),
-            sa.ForeignKey(
-                "invoices.id",
-                ondelete="CASCADE",
-            ),
-            nullable=False,
-        ),
-
-        sa.Column(
-            "product_name",
-            sa.String(length=200),
-            nullable=False,
-        ),
-
-        sa.Column(
-            "item_number",
-            sa.Integer(),
-            nullable=False,
-        ),
-
-        sa.Column(
-            "unit_price",
+            "grand_total",
             sa.Numeric(
                 precision=12,
                 scale=2,
             ),
             nullable=False,
+            server_default="0.00",
         ),
     )
 
-    # --------------------------------------------------------
-    # 4. Index invoice_id for faster invoice item lookup
-    # --------------------------------------------------------
-
-    op.create_index(
-        "ix_invoice_items_invoice_id",
-        "invoice_items",
-        ["invoice_id"],
+    # Remove server default after existing rows have
+    # received the value.
+    op.alter_column(
+        "invoices",
+        "grand_total",
+        server_default=None,
     )
 
 
@@ -126,67 +164,48 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # --------------------------------------------------------
-    # 1. Remove invoice_items
-    # --------------------------------------------------------
+    """
+    Reverse migration 0002.
 
-    op.drop_index(
-        "ix_invoice_items_invoice_id",
-        table_name="invoice_items",
-    )
+    Removes:
 
-    op.drop_table(
-        "invoice_items",
-    )
+        grand_total
+        gst_enabled
+        payment_mode
+    """
 
-    # --------------------------------------------------------
-    # 2. Restore old invoice columns
-    #
-    # WARNING:
-    # These are restored empty/default values because the
-    # individual invoice item data cannot automatically be
-    # reconstructed after the migration has been downgraded.
-    # --------------------------------------------------------
+    # ========================================================
+    # GRAND TOTAL
+    # ========================================================
 
-    op.add_column(
+    op.drop_column(
         "invoices",
-        sa.Column(
-            "product_name",
-            sa.String(length=200),
-            nullable=True,
-        ),
+        "grand_total",
     )
 
-    op.add_column(
+    # ========================================================
+    # GST ENABLED
+    # ========================================================
+
+    op.drop_column(
         "invoices",
-        sa.Column(
-            "quantity",
-            sa.Integer(),
-            nullable=False,
-            server_default="1",
-        ),
+        "gst_enabled",
     )
 
-    op.add_column(
+    # ========================================================
+    # PAYMENT MODE
+    # ========================================================
+
+    op.drop_column(
         "invoices",
-        sa.Column(
-            "unit_price",
-            sa.Numeric(
-                precision=12,
-                scale=2,
-            ),
-            nullable=False,
-            server_default="0",
-        ),
+        "payment_mode",
     )
 
-    # --------------------------------------------------------
-    # 3. Restore customer phone as required
-    # --------------------------------------------------------
+    # ========================================================
+    # PAYMENT MODE ENUM
+    # ========================================================
 
-    op.alter_column(
-        "invoices",
-        "customer_phone",
-        existing_type=sa.String(length=20),
-        nullable=False,
+    payment_mode.drop(
+        op.get_bind(),
+        checkfirst=True,
     )

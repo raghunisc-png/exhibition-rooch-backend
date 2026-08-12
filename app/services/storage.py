@@ -13,18 +13,17 @@ Used for:
 
 The database stores only the relative storage path/key.
 
-Example:
+Examples:
 
     photos/abc123.jpg
     invoices/INV-2026-0001.pdf
-
-The public URL is generated separately using `public_url()`.
 """
 
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
+from functools import lru_cache
+from pathlib import Path, PurePosixPath
 
 from fastapi import UploadFile
 
@@ -35,18 +34,29 @@ settings = get_settings()
 
 
 # ============================================================
+# CONSTANTS
+# ============================================================
+
+MAX_UPLOAD_BYTES = (
+    8 * 1024 * 1024
+)
+
+DEFAULT_EXTENSION = ".bin"
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
 
 def _ext_for(
     filename: str | None,
-    default: str = ".bin",
+    default: str = DEFAULT_EXTENSION,
 ) -> str:
     """
     Extract a safe lowercase file extension.
 
-    Example:
+    Examples:
 
         photo.jpg -> .jpg
         image.PNG -> .png
@@ -56,16 +66,118 @@ def _ext_for(
     if not filename:
         return default
 
-    ext = Path(filename).suffix.lower()
+    ext = Path(
+        filename
+    ).suffix.lower()
 
     if not ext:
         return default
 
-    # Keep extension reasonably constrained.
+    # Prevent unusual / excessively long extensions.
     if len(ext) > 10:
         return default
 
+    # Only allow simple extensions.
+    if not ext.startswith("."):
+        return default
+
+    if not ext[1:].isalnum():
+        return default
+
     return ext
+
+
+def _safe_relative_path(
+    relative_path: str,
+) -> str:
+    """
+    Validate and normalize a storage-relative path.
+
+    Storage paths always use POSIX-style separators because
+    they are also used as S3 object keys.
+    """
+
+    if not relative_path:
+        raise ValueError(
+            "Storage path is required."
+        )
+
+    path = PurePosixPath(
+        str(relative_path)
+        .replace("\\", "/")
+    )
+
+    if path.is_absolute():
+        raise ValueError(
+            "Absolute storage paths are not allowed."
+        )
+
+    parts = path.parts
+
+    if not parts:
+        raise ValueError(
+            "Invalid storage path."
+        )
+
+    if any(
+        part in {"", ".", ".."}
+        for part in parts
+    ):
+        raise ValueError(
+            "Invalid storage path."
+        )
+
+    return "/".join(parts)
+
+
+def _safe_subdir(
+    subdir: str,
+) -> str:
+    """
+    Validate a storage subdirectory.
+    """
+
+    return _safe_relative_path(
+        subdir
+    )
+
+
+def _safe_filename(
+    filename: str,
+) -> str:
+    """
+    Validate a storage filename.
+
+    The filename must be a single path component.
+    """
+
+    if not filename:
+        raise ValueError(
+            "Storage filename is required."
+        )
+
+    normalized = str(
+        filename
+    ).replace("\\", "/")
+
+    path = PurePosixPath(
+        normalized
+    )
+
+    if (
+        len(path.parts) != 1
+        or path.name != normalized
+        or path.name in {
+            "",
+            ".",
+            "..",
+        }
+    ):
+        raise ValueError(
+            "Invalid storage filename."
+        )
+
+    return path.name
 
 
 # ============================================================
@@ -92,6 +204,38 @@ class LocalStorage:
         )
 
     # --------------------------------------------------------
+    # SAFE PATH
+    # --------------------------------------------------------
+
+    def _absolute_storage_path(
+        self,
+        relative_path: str,
+    ) -> Path:
+        """
+        Resolve a storage-relative path safely.
+        """
+
+        safe_relative = (
+            _safe_relative_path(
+                relative_path
+            )
+        )
+
+        path = (
+            self.base_dir
+            / Path(safe_relative)
+        ).resolve()
+
+        if not path.is_relative_to(
+            self.base_dir
+        ):
+            raise ValueError(
+                "Invalid storage path."
+            )
+
+        return path
+
+    # --------------------------------------------------------
     # SAVE BYTES
     # --------------------------------------------------------
 
@@ -107,44 +251,48 @@ class LocalStorage:
         Returns the relative path stored in the database.
         """
 
-        target_dir = (
-            self.base_dir / subdir
-        ).resolve()
-
-        # Prevent directory traversal.
-        if not str(target_dir).startswith(
-            str(self.base_dir)
-        ):
+        if not data:
             raise ValueError(
-                "Invalid storage directory."
+                "Cannot store empty data."
             )
 
-        target_dir.mkdir(
+        safe_subdir = (
+            _safe_subdir(
+                subdir
+            )
+        )
+
+        safe_filename = (
+            _safe_filename(
+                filename
+            )
+        )
+
+        relative_path = (
+            f"{safe_subdir}/"
+            f"{safe_filename}"
+        )
+
+        path = (
+            self._absolute_storage_path(
+                relative_path
+            )
+        )
+
+        path.parent.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        path = (
-            target_dir / filename
-        ).resolve()
+        with path.open(
+            "wb"
+        ) as file:
 
-        # Prevent filename/path traversal.
-        if not str(path).startswith(
-            str(target_dir)
-        ):
-            raise ValueError(
-                "Invalid storage filename."
+            file.write(
+                data
             )
 
-        with open(
-            path,
-            "wb",
-        ) as file:
-            file.write(data)
-
-        return (
-            f"{subdir}/{filename}"
-        )
+        return relative_path
 
     # --------------------------------------------------------
     # PUBLIC URL
@@ -159,9 +307,16 @@ class LocalStorage:
         a publicly accessible URL.
         """
 
+        safe_relative = (
+            _safe_relative_path(
+                relative_path
+            )
+        )
+
         return (
             f"{settings.PUBLIC_BASE_URL.rstrip('/')}"
-            f"/files/{relative_path}"
+            f"/files/"
+            f"{safe_relative}"
         )
 
     # --------------------------------------------------------
@@ -177,23 +332,14 @@ class LocalStorage:
         an absolute filesystem path.
 
         Used by the PDF generator when it needs
-        to load the product photo.
+        to load a product photo.
         """
 
-        path = (
-            self.base_dir
-            / relative_path
-        ).resolve()
-
-        # Prevent directory traversal.
-        if not str(path).startswith(
-            str(self.base_dir)
-        ):
-            raise ValueError(
-                "Invalid storage path."
+        return (
+            self._absolute_storage_path(
+                relative_path
             )
-
-        return path
+        )
 
 
 # ============================================================
@@ -205,12 +351,18 @@ class S3Storage:
     """
     S3-compatible object storage.
 
-    boto3 is imported lazily so local deployments
-    don't require it unless S3 storage is selected.
+    boto3 is imported lazily so local deployments do not
+    require S3 dependencies unless S3 storage is selected.
     """
 
     def __init__(self):
         import boto3
+
+        if not settings.S3_BUCKET:
+            raise ValueError(
+                "S3_BUCKET is required when "
+                "STORAGE_BACKEND=s3."
+            )
 
         self.client = boto3.client(
             "s3",
@@ -232,13 +384,9 @@ class S3Storage:
             ),
         )
 
-        self.bucket = settings.S3_BUCKET
-
-        if not self.bucket:
-            raise ValueError(
-                "S3_BUCKET is required when "
-                "STORAGE_BACKEND=s3."
-            )
+        self.bucket = (
+            settings.S3_BUCKET
+        )
 
     # --------------------------------------------------------
     # SAVE BYTES
@@ -249,19 +397,47 @@ class S3Storage:
         data: bytes,
         subdir: str,
         filename: str,
+        content_type: str | None = None,
     ) -> str:
         """
         Upload bytes to S3-compatible storage.
         """
 
-        key = (
-            f"{subdir}/{filename}"
+        if not data:
+            raise ValueError(
+                "Cannot store empty data."
+            )
+
+        safe_subdir = (
+            _safe_subdir(
+                subdir
+            )
         )
 
+        safe_filename = (
+            _safe_filename(
+                filename
+            )
+        )
+
+        key = (
+            f"{safe_subdir}/"
+            f"{safe_filename}"
+        )
+
+        put_kwargs = {
+            "Bucket": self.bucket,
+            "Key": key,
+            "Body": data,
+        }
+
+        if content_type:
+            put_kwargs[
+                "ContentType"
+            ] = content_type
+
         self.client.put_object(
-            Bucket=self.bucket,
-            Key=key,
-            Body=data,
+            **put_kwargs
         )
 
         return key
@@ -276,24 +452,60 @@ class S3Storage:
     ) -> str:
         """
         Generate a public URL for an S3 object.
+
+        For S3-compatible providers, S3_ENDPOINT_URL is used
+        when configured.
+
+        IMPORTANT:
+        The bucket/object must actually be publicly accessible
+        for this URL to work.
         """
 
-        # Custom S3-compatible endpoint
-        # such as MinIO, Cloudflare R2, etc.
+        safe_relative = (
+            _safe_relative_path(
+                relative_path
+            )
+        )
+
         if settings.S3_ENDPOINT_URL:
 
             return (
                 f"{settings.S3_ENDPOINT_URL.rstrip('/')}"
                 f"/{self.bucket}"
-                f"/{relative_path}"
+                f"/{safe_relative}"
             )
 
-        # Standard AWS S3.
+        if not settings.S3_REGION:
+            raise ValueError(
+                "S3_REGION is required for "
+                "standard AWS S3 public URLs."
+            )
+
         return (
             f"https://{self.bucket}"
             f".s3.{settings.S3_REGION}"
             f".amazonaws.com/"
-            f"{relative_path}"
+            f"{safe_relative}"
+        )
+
+    # --------------------------------------------------------
+    # ABSOLUTE PATH
+    # --------------------------------------------------------
+
+    def absolute_path(
+        self,
+        relative_path: str,
+    ) -> Path:
+        """
+        S3 objects do not have a local filesystem path.
+
+        The PDF generator should only call this method when
+        using local storage.
+        """
+
+        raise RuntimeError(
+            "absolute_path() is not available "
+            "for S3 storage."
         )
 
 
@@ -302,12 +514,20 @@ class S3Storage:
 # ============================================================
 
 
+@lru_cache(maxsize=1)
 def get_storage():
     """
     Return the configured storage backend.
+
+    The storage instance is cached so an S3 client or local
+    storage object is not recreated on every request.
     """
 
-    if settings.STORAGE_BACKEND == "s3":
+    if (
+        settings.STORAGE_BACKEND
+        == "s3"
+    ):
+
         return S3Storage()
 
     return LocalStorage(
@@ -330,12 +550,19 @@ async def save_upload(
     Used by the online invoice endpoint.
 
     Returns the relative storage path.
+
+    Maximum upload size:
+        8 MB
     """
 
     if not file:
         raise ValueError(
             "File is required."
         )
+
+    # --------------------------------------------------------
+    # Read upload
+    # --------------------------------------------------------
 
     data = await file.read()
 
@@ -344,12 +571,46 @@ async def save_upload(
             "Uploaded file is empty."
         )
 
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            "Uploaded file exceeds the 8MB limit."
+        )
+
+    # --------------------------------------------------------
+    # Generate safe filename
+    # --------------------------------------------------------
+
     filename = (
         f"{uuid.uuid4().hex}"
         f"{_ext_for(file.filename)}"
     )
 
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
     storage = get_storage()
+
+    content_type = (
+        getattr(
+            file,
+            "content_type",
+            None,
+        )
+        or None
+    )
+
+    if isinstance(
+        storage,
+        S3Storage,
+    ):
+
+        return storage.save_bytes(
+            data,
+            subdir,
+            filename,
+            content_type=content_type,
+        )
 
     return storage.save_bytes(
         data,
@@ -407,14 +668,16 @@ def public_url(
 
     becomes:
 
-        http://localhost:8000/files/invoices/INV-2026-0001.pdf
+        http://localhost:8000/files/
+        invoices/INV-2026-0001.pdf
     """
 
-    if not relative_path:
-        raise ValueError(
-            "Storage path is required."
+    safe_relative = (
+        _safe_relative_path(
+            relative_path
         )
+    )
 
     return get_storage().url_for(
-        relative_path
+        safe_relative
     )

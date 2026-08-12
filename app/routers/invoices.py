@@ -1,16 +1,40 @@
 """
 Invoice API.
 
-Online invoices are submitted as multipart/form-data because the
-product photo is uploaded together with the invoice information.
+Handles:
 
-The invoice contains multiple individually priced items.
+    GET  /api/invoices
+    GET  /api/invoices/{invoice_id}
+    POST /api/invoices
+    POST /api/invoices/{invoice_id}/resend
+
+Offline synchronization is handled separately by:
+
+    POST /api/sync/invoices
+
+Important invoice rules:
+
+1. Product prices are final customer-facing prices.
+2. Product prices already include GST.
+3. GST is extracted from the inclusive amount.
+4. GST is NEVER added again to the product subtotal.
+5. Discount is deducted from the customer-facing subtotal.
+6. grand_total is calculated by the backend and persisted.
+7. gst_enabled controls whether GST is applied.
+8. client_uuid provides offline idempotency.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+
 from datetime import datetime
+from decimal import (
+    Decimal,
+    InvalidOperation,
+    ROUND_HALF_UP,
+)
 
 from fastapi import (
     APIRouter,
@@ -21,23 +45,42 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import or_
+
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import get_current_agent
-from app.models import Agent, Invoice, InvoiceItem
+
+from app.models import (
+    Agent,
+    Invoice,
+)
+
 from app.schemas import (
     InvoiceCreate,
+    InvoiceItemCreate,
     InvoiceListItem,
     InvoiceOut,
-    ResendRequest,
+    PaymentMode,
 )
+
 from app.services import storage
+
 from app.services.invoice_service import (
     create_and_deliver,
     deliver_invoice,
 )
+
+
+logger = logging.getLogger(
+    __name__
+)
+
+
+# ============================================================
+# ROUTER
+# ============================================================
 
 router = APIRouter(
     prefix="/api/invoices",
@@ -45,18 +88,500 @@ router = APIRouter(
 )
 
 
-MAX_PHOTO_BYTES = 8 * 1024 * 1024
+# ============================================================
+# CONSTANTS
+# ============================================================
 
-ALLOWED_CONTENT_TYPES = {
+ALLOWED_PHOTO_CONTENT_TYPES = {
     "image/jpeg",
     "image/png",
     "image/webp",
     "image/heic",
 }
 
+MONEY_QUANT = Decimal(
+    "0.01"
+)
+
 
 # ============================================================
-# CREATE
+# MONEY HELPER
+# ============================================================
+
+
+def _money(
+    value: Decimal | None,
+) -> Decimal:
+    """
+    Normalize monetary values to two decimal places.
+    """
+
+    if value is None:
+        value = Decimal(
+            "0.00"
+        )
+
+    return Decimal(
+        value
+    ).quantize(
+        MONEY_QUANT,
+        rounding=ROUND_HALF_UP,
+    )
+
+
+# ============================================================
+# ITEMS PARSER
+# ============================================================
+
+
+def _parse_items(
+    raw_items: str,
+) -> list[InvoiceItemCreate]:
+    """
+    Parse invoice items from JSON.
+
+    Frontend sends:
+
+        items = JSON.stringify(invoice.items)
+    """
+
+    if not raw_items:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Invoice items are required."
+            ),
+        )
+
+    try:
+
+        parsed = json.loads(
+            raw_items
+        )
+
+    except json.JSONDecodeError as exc:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Invalid invoice items JSON."
+            ),
+        ) from exc
+
+    if not isinstance(
+        parsed,
+        list,
+    ):
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Invoice items must be an array."
+            ),
+        )
+
+    if not parsed:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "At least one invoice item is required."
+            ),
+        )
+
+    validated_items: list[
+        InvoiceItemCreate
+    ] = []
+
+    for index, item in enumerate(
+        parsed
+    ):
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY
+                ),
+                detail=(
+                    f"Invoice item "
+                    f"{index + 1} must be an object."
+                ),
+            )
+
+        try:
+
+            validated_item = (
+                InvoiceItemCreate.model_validate(
+                    item
+                )
+            )
+
+        except Exception as exc:
+
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY
+                ),
+                detail=(
+                    f"Invalid invoice item "
+                    f"{index + 1}: {exc}"
+                ),
+            ) from exc
+
+        validated_items.append(
+            validated_item
+        )
+
+    return validated_items
+
+
+# ============================================================
+# CAPTURED AT
+# ============================================================
+
+
+def _parse_captured_at(
+    value: str | None,
+) -> datetime:
+    """
+    Convert frontend ISO timestamp to datetime.
+    """
+
+    if not value:
+
+        return datetime.utcnow()
+
+    value = value.strip()
+
+    if not value:
+
+        return datetime.utcnow()
+
+    try:
+
+        return datetime.fromisoformat(
+            value.replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+    except ValueError:
+
+        return datetime.utcnow()
+
+
+# ============================================================
+# PAYMENT MODE
+# ============================================================
+
+
+def _normalize_payment_mode(
+    value: str | None,
+) -> PaymentMode:
+    """
+    Normalize payment mode.
+
+    Allowed:
+
+        online
+        cash
+    """
+
+    normalized = (
+        value or "online"
+    ).strip().lower()
+
+    if normalized not in {
+        "online",
+        "cash",
+    }:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Payment mode must be "
+                "'online' or 'cash'."
+            ),
+        )
+
+    return PaymentMode(
+        normalized
+    )
+
+
+# ============================================================
+# DECIMAL PARSER
+# ============================================================
+
+
+def _parse_decimal(
+    value: str | None,
+    field_name: str,
+) -> Decimal:
+    """
+    Convert FormData value to Decimal.
+    """
+
+    if value is None:
+
+        value = "0"
+
+    value = str(
+        value
+    ).strip()
+
+    if not value:
+
+        value = "0"
+
+    try:
+
+        decimal_value = Decimal(
+            value
+        )
+
+    except (
+        InvalidOperation,
+        ValueError,
+    ) as exc:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                f"Invalid {field_name}."
+            ),
+        ) from exc
+
+    if not decimal_value.is_finite():
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                f"Invalid {field_name}."
+            ),
+        )
+
+    return _money(
+        decimal_value
+    )
+
+
+# ============================================================
+# GST ENABLED PARSER
+# ============================================================
+
+
+def _parse_bool(
+    value: str | None,
+    default: bool = False,
+) -> bool:
+    """
+    Convert FormData boolean values.
+
+    Supported:
+
+        true
+        false
+        1
+        0
+        yes
+        no
+        on
+        off
+    """
+
+    if value is None:
+
+        return default
+
+    normalized = (
+        str(value)
+        .strip()
+        .lower()
+    )
+
+    if normalized in {
+        "true",
+        "1",
+        "yes",
+        "on",
+    }:
+
+        return True
+
+    if normalized in {
+        "false",
+        "0",
+        "no",
+        "off",
+    }:
+
+        return False
+
+    raise HTTPException(
+        status_code=(
+            status.HTTP_422_UNPROCESSABLE_ENTITY
+        ),
+        detail=(
+            "gst_enabled must be true or false."
+        ),
+    )
+
+
+# ============================================================
+# INVOICE OUTPUT
+# ============================================================
+
+
+def _invoice_to_output(
+    invoice: Invoice,
+) -> InvoiceOut:
+    """
+    Convert SQLAlchemy Invoice to InvoiceOut.
+    """
+
+    return InvoiceOut.model_validate(
+        invoice
+    )
+
+
+# ============================================================
+# GET INVOICE LIST
+# ============================================================
+
+
+@router.get(
+    "",
+    response_model=list[InvoiceListItem],
+)
+def get_invoices(
+    q: str | None = None,
+    db: Session = Depends(
+        get_db
+    ),
+    agent: Agent = Depends(
+        get_current_agent
+    ),
+) -> list[InvoiceListItem]:
+
+    query = (
+        db.query(Invoice)
+        .filter(
+            Invoice.agent_id
+            == agent.id
+        )
+    )
+
+    if q:
+
+        search = q.strip()
+
+        if search:
+
+            pattern = (
+                f"%{search}%"
+            )
+
+            query = query.filter(
+                (
+                    Invoice.customer_name.ilike(
+                        pattern
+                    )
+                )
+                |
+                (
+                    Invoice.invoice_number.ilike(
+                        pattern
+                    )
+                )
+                |
+                (
+                    Invoice.customer_phone.ilike(
+                        pattern
+                    )
+                )
+            )
+
+    invoices = (
+        query
+        .order_by(
+            Invoice.created_at.desc()
+        )
+        .all()
+    )
+
+    return [
+        InvoiceListItem.model_validate(
+            invoice
+        )
+        for invoice in invoices
+    ]
+
+
+# ============================================================
+# GET SINGLE INVOICE
+# ============================================================
+
+
+@router.get(
+    "/{invoice_id}",
+    response_model=InvoiceOut,
+)
+def get_invoice(
+    invoice_id: int,
+    db: Session = Depends(
+        get_db
+    ),
+    agent: Agent = Depends(
+        get_current_agent
+    ),
+) -> InvoiceOut:
+
+    invoice = (
+        db.query(Invoice)
+        .filter(
+            Invoice.id == invoice_id,
+            Invoice.agent_id == agent.id,
+        )
+        .first()
+    )
+
+    if not invoice:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_404_NOT_FOUND
+            ),
+            detail="Invoice not found.",
+        )
+
+    return _invoice_to_output(
+        invoice
+    )
+
+
+# ============================================================
+# CREATE INVOICE
 # ============================================================
 
 
@@ -67,323 +592,548 @@ ALLOWED_CONTENT_TYPES = {
 )
 async def create_invoice(
     client_uuid: str = Form(...),
-
     customer_name: str = Form(...),
-
-    # Optional according to the new frontend.
     customer_phone: str | None = Form(None),
-
-    # Optional.
     customer_email: str | None = Form(None),
-
-    # JSON string containing InvoiceItemCreate[].
-    #
-    # Example:
-    #
-    # [
-    #   {
-    #     "product_name": "Rings",
-    #     "item_number": 1,
-    #     "unit_price": 250
-    #   },
-    #   {
-    #     "product_name": "Rings",
-    #     "item_number": 2,
-    #     "unit_price": 400
-    #   }
-    # ]
     items: str = Form(...),
-
     product_description: str | None = Form(None),
 
-    tax_percent: float = Form(0),
+    # GST
+    tax_percent: str = Form("0"),
+    gst_enabled: str = Form("false"),
 
-    discount_amount: float = Form(0),
+    # Discount
+    discount_amount: str = Form("0"),
 
+    # Frontend may send grand_total.
+    #
+    # IMPORTANT:
+    # Backend does NOT trust this value.
+    # It recalculates grand_total.
+    grand_total: str | None = Form(None),
+
+    payment_mode: str = Form("online"),
     notes: str | None = Form(None),
-
     exhibition_name: str | None = Form(None),
+    captured_at: str | None = Form(None),
 
-    captured_at: datetime | None = Form(None),
-
-    # REQUIRED.
     photo: UploadFile = File(...),
 
-    db: Session = Depends(get_db),
+    db: Session = Depends(
+        get_db
+    ),
 
-    agent: Agent = Depends(get_current_agent),
-):
-    # --------------------------------------------------------
-    # Product photo is mandatory
-    # --------------------------------------------------------
+    agent: Agent = Depends(
+        get_current_agent
+    ),
+) -> InvoiceOut:
 
-    if photo is None or not photo.filename:
+    """
+    Create a new invoice.
+
+    GST-inclusive pricing rules:
+
+        Product prices already include GST.
+
+        subtotal =
+            sum(product prices)
+
+        taxable value =
+            subtotal / (1 + GST / 100)
+
+        GST =
+            subtotal - taxable value
+
+        grand_total =
+            subtotal - discount
+
+    GST is never added again.
+    """
+
+    # ========================================================
+    # BASIC VALIDATION
+    # ========================================================
+
+    client_uuid = (
+        client_uuid.strip()
+    )
+
+    if not client_uuid:
+
         raise HTTPException(
-            status_code=400,
-            detail="Product photo is required.",
-        )
-
-    if photo.content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
             detail=(
-                f"Unsupported photo type: "
-                f"{photo.content_type}"
+                "client_uuid is required."
             ),
         )
 
-    # --------------------------------------------------------
-    # Parse items JSON
-    # --------------------------------------------------------
+    if len(client_uuid) > 36:
 
-    try:
-        parsed_items = json.loads(items)
-    except json.JSONDecodeError:
         raise HTTPException(
-            status_code=422,
-            detail="Invalid items JSON.",
-        )
-
-    if not isinstance(parsed_items, list):
-        raise HTTPException(
-            status_code=422,
-            detail="items must be a JSON array.",
-        )
-
-    # --------------------------------------------------------
-    # Validate request through Pydantic
-    # --------------------------------------------------------
-
-    try:
-        payload = InvoiceCreate(
-            client_uuid=client_uuid,
-            customer_name=customer_name,
-            customer_phone=customer_phone,
-            customer_email=(
-                customer_email
-                or None
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
             ),
-            items=parsed_items,
-            product_description=product_description,
-            tax_percent=tax_percent,
-            discount_amount=discount_amount,
-            notes=notes,
-            exhibition_name=exhibition_name,
-            captured_at=captured_at,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=str(exc),
+            detail=(
+                "client_uuid must not exceed 36 characters."
+            ),
         )
 
-    # --------------------------------------------------------
-    # Idempotency
-    # --------------------------------------------------------
+    customer_name = (
+        customer_name.strip()
+    )
+
+    if not customer_name:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Customer name is required."
+            ),
+        )
+
+    # ========================================================
+    # IDEMPOTENCY
+    # ========================================================
 
     existing = (
         db.query(Invoice)
         .filter(
             Invoice.client_uuid
-            == payload.client_uuid
+            == client_uuid,
+            Invoice.agent_id
+            == agent.id,
         )
         .first()
     )
 
     if existing:
-        return existing
 
-    # --------------------------------------------------------
-    # Check photo size
-    # --------------------------------------------------------
-
-    photo_bytes = await photo.read()
-
-    if len(photo_bytes) > MAX_PHOTO_BYTES:
-        raise HTTPException(
-            status_code=400,
-            detail="Photo exceeds 8MB limit.",
+        return _invoice_to_output(
+            existing
         )
 
-    # Reset UploadFile so storage.save_upload()
-    # can read it again.
-    await photo.seek(0)
+    # ========================================================
+    # ITEMS
+    # ========================================================
 
-    # --------------------------------------------------------
-    # Save photo
-    # --------------------------------------------------------
-
-    photo_path = await storage.save_upload(
-        photo,
-        "photos",
+    invoice_items = _parse_items(
+        items
     )
 
-    # --------------------------------------------------------
-    # Prepare invoice data
-    # --------------------------------------------------------
+    # ========================================================
+    # PAYMENT
+    # ========================================================
 
-    data = payload.model_dump(
-        exclude={
-            "client_uuid",
-        }
-    )
-
-    data["captured_at"] = (
-        data["captured_at"]
-        or datetime.utcnow()
-    )
-
-    # --------------------------------------------------------
-    # Create invoice + items + PDF + delivery
-    # --------------------------------------------------------
-
-    try:
-        invoice = create_and_deliver(
-            db=db,
-            agent=agent,
-            data={
-                "client_uuid": payload.client_uuid,
-                **data,
-            },
-            photo_relative_path=photo_path,
+    normalized_payment_mode = (
+        _normalize_payment_mode(
+            payment_mode
         )
+    )
 
-    except ValueError as exc:
-        db.rollback()
+    # ========================================================
+    # GST ENABLED
+    # ========================================================
+
+    gst_is_enabled = _parse_bool(
+        gst_enabled,
+        default=False,
+    )
+
+    # ========================================================
+    # GST RATE
+    # ========================================================
+
+    tax_value = _parse_decimal(
+        tax_percent,
+        "GST percentage",
+    )
+
+    if (
+        tax_value < Decimal("0.00")
+        or tax_value > Decimal("100.00")
+    ):
 
         raise HTTPException(
-            status_code=422,
-            detail=str(exc),
-        )
-
-    return invoice
-
-
-# ============================================================
-# LIST
-# ============================================================
-
-
-@router.get(
-    "",
-    response_model=list[InvoiceListItem],
-)
-def list_invoices(
-    db: Session = Depends(get_db),
-    agent: Agent = Depends(get_current_agent),
-    q: str | None = None,
-    limit: int = 100,
-    offset: int = 0,
-):
-    query = db.query(Invoice)
-
-    # Agents see only their own invoices.
-    # Admins see all invoices.
-    if agent.role != "admin":
-        query = query.filter(
-            Invoice.agent_id == agent.id
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "GST percentage must be "
+                "between 0 and 100."
+            ),
         )
 
     # --------------------------------------------------------
-    # Search
+    # If GST is disabled, force rate to zero.
     # --------------------------------------------------------
 
-    if q:
-        like = f"%{q}%"
+    if not gst_is_enabled:
 
-        query = (
-            query
-            .outerjoin(
-                InvoiceItem,
-                InvoiceItem.invoice_id
-                == Invoice.id,
-            )
-            .filter(
-                or_(
-                    Invoice.customer_name.ilike(
-                        like
-                    ),
-                    Invoice.customer_phone.ilike(
-                        like
-                    ),
-                    Invoice.invoice_number.ilike(
-                        like
-                    ),
-                    InvoiceItem.product_name.ilike(
-                        like
-                    ),
+        tax_value = Decimal(
+            "0.00"
+        )
+
+    # ========================================================
+    # DISCOUNT
+    # ========================================================
+
+    discount_value = _parse_decimal(
+        discount_amount,
+        "discount amount",
+    )
+
+    if discount_value < Decimal(
+        "0.00"
+    ):
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Discount amount cannot be negative."
+            ),
+        )
+
+    # ========================================================
+    # CALCULATE SUBTOTAL
+    # ========================================================
+
+    subtotal = _money(
+        sum(
+            (
+                _money(
+                    item.unit_price
                 )
+                for item in invoice_items
+            ),
+            Decimal("0.00"),
+        )
+    )
+
+    # ========================================================
+    # DISCOUNT VALIDATION
+    # ========================================================
+
+    if discount_value > subtotal:
+
+        discount_value = subtotal
+
+    # ========================================================
+    # CALCULATE GRAND TOTAL
+    # ========================================================
+
+    grand_total_value = max(
+        Decimal("0.00"),
+        _money(
+            subtotal
+            - discount_value
+        ),
+    )
+
+    # ========================================================
+    # CALCULATE GST
+    # ========================================================
+
+    if (
+        gst_is_enabled
+        and tax_value > Decimal("0.00")
+        and grand_total_value > Decimal("0.00")
+    ):
+
+        # ----------------------------------------------------
+        # GST is inclusive.
+        #
+        # GST must be calculated from the amount actually
+        # charged after discount.
+        # ----------------------------------------------------
+
+        divisor = (
+            Decimal("1.00")
+            + (
+                tax_value
+                / Decimal("100.00")
             )
-            .distinct()
         )
 
-    return (
-        query
-        .order_by(
-            Invoice.created_at.desc()
+        taxable_value = _money(
+            grand_total_value
+            / divisor
         )
-        .offset(offset)
-        .limit(min(limit, 200))
-        .all()
-    )
 
+        gst_amount = _money(
+            grand_total_value
+            - taxable_value
+        )
 
-# ============================================================
-# OWNERSHIP
-# ============================================================
+    else:
 
+        taxable_value = grand_total_value
 
-def _get_owned_invoice(
-    db: Session,
-    agent: Agent,
-    invoice_id: int,
-) -> Invoice:
-    invoice = db.get(
-        Invoice,
-        invoice_id,
-    )
+        gst_amount = Decimal(
+            "0.00"
+        )
 
-    if invoice is None:
+    # ========================================================
+    # PHOTO VALIDATION
+    # ========================================================
+
+    if not photo:
+
         raise HTTPException(
-            status_code=404,
-            detail="Invoice not found",
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Product photo is required."
+            ),
+        )
+
+    if not photo.content_type:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Product photo content type is missing."
+            ),
         )
 
     if (
-        agent.role != "admin"
-        and invoice.agent_id != agent.id
+        photo.content_type
+        not in ALLOWED_PHOTO_CONTENT_TYPES
     ):
+
         raise HTTPException(
-            status_code=403,
-            detail="Not your invoice",
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=(
+                "Unsupported product photo type."
+            ),
         )
 
-    return invoice
+    # ========================================================
+    # BUILD INVOICE DATA
+    # ========================================================
 
+    try:
 
-# ============================================================
-# GET ONE
-# ============================================================
+        invoice_data = InvoiceCreate(
+            client_uuid=client_uuid,
 
+            customer_name=customer_name,
 
-@router.get(
-    "/{invoice_id}",
-    response_model=InvoiceOut,
-)
-def get_invoice(
-    invoice_id: int,
-    db: Session = Depends(get_db),
-    agent: Agent = Depends(get_current_agent),
-):
-    return _get_owned_invoice(
-        db,
-        agent,
-        invoice_id,
+            customer_phone=(
+                customer_phone.strip()
+                if customer_phone
+                else None
+            ),
+
+            customer_email=(
+                customer_email.strip()
+                if customer_email
+                else None
+            ),
+
+            items=invoice_items,
+
+            product_description=(
+                product_description.strip()
+                if product_description
+                else None
+            ),
+
+            tax_percent=tax_value,
+
+            gst_enabled=gst_is_enabled,
+
+            discount_amount=discount_value,
+
+            # Backend-calculated value.
+            grand_total=grand_total_value,
+
+            payment_mode=(
+                normalized_payment_mode
+            ),
+
+            notes=(
+                notes.strip()
+                if notes
+                else None
+            ),
+
+            exhibition_name=(
+                exhibition_name.strip()
+                if exhibition_name
+                else None
+            ),
+
+            captured_at=(
+                _parse_captured_at(
+                    captured_at
+                )
+            ),
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=str(exc),
+        ) from exc
+
+    # ========================================================
+    # SAVE PHOTO
+    # ========================================================
+
+    photo_relative_path: str | None = None
+
+    try:
+
+        photo_relative_path = (
+            await storage.save_upload(
+                photo,
+                "photos",
+            )
+        )
+
+    except ValueError as exc:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+
+        logger.exception(
+            "Failed to save invoice product photo."
+        )
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            ),
+            detail=(
+                "Unable to save product photo."
+            ),
+        ) from exc
+
+    # ========================================================
+    # CREATE + DELIVER
+    # ========================================================
+
+    try:
+
+        invoice = create_and_deliver(
+            db=db,
+
+            agent=agent,
+
+            data=invoice_data.model_dump(
+                mode="json"
+            ),
+
+            photo_relative_path=(
+                photo_relative_path
+            ),
+        )
+
+    except ValueError as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=str(exc),
+        ) from exc
+
+    except IntegrityError as exc:
+
+        db.rollback()
+
+        # ----------------------------------------------------
+        # Race-condition-safe idempotency.
+        # ----------------------------------------------------
+
+        existing = (
+            db.query(Invoice)
+            .filter(
+                Invoice.client_uuid
+                == client_uuid,
+
+                Invoice.agent_id
+                == agent.id,
+            )
+            .first()
+        )
+
+        if existing:
+
+            return _invoice_to_output(
+                existing
+            )
+
+        logger.exception(
+            "Database integrity error "
+            "while creating invoice."
+        )
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            ),
+            detail=(
+                "Database error while creating invoice."
+            ),
+        ) from exc
+
+    except Exception as exc:
+
+        db.rollback()
+
+        logger.exception(
+            "Failed to create invoice."
+        )
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            ),
+            detail=(
+                "Invoice creation failed."
+            ),
+        ) from exc
+
+    # ========================================================
+    # FINAL DATABASE REFRESH
+    # ========================================================
+
+    db.refresh(
+        invoice
+    )
+
+    return _invoice_to_output(
+        invoice
     )
 
 
 # ============================================================
-# RESEND
+# RESEND INVOICE
 # ============================================================
 
 
@@ -393,21 +1143,95 @@ def get_invoice(
 )
 def resend_invoice(
     invoice_id: int,
-    payload: ResendRequest | None = None,
-    db: Session = Depends(get_db),
-    agent: Agent = Depends(get_current_agent),
-):
-    invoice = _get_owned_invoice(
-        db,
-        agent,
-        invoice_id,
+
+    db: Session = Depends(
+        get_db
+    ),
+
+    agent: Agent = Depends(
+        get_current_agent
+    ),
+) -> InvoiceOut:
+
+    """
+    Resend an existing invoice.
+
+    Delivery workflow:
+
+        existing PDF
+             |
+             v
+        WhatsApp
+             |
+             +-- failed --> SMS fallback
+    """
+
+    # ========================================================
+    # FIND INVOICE
+    # ========================================================
+
+    invoice = (
+        db.query(Invoice)
+        .filter(
+            Invoice.id == invoice_id,
+            Invoice.agent_id == agent.id,
+        )
+        .first()
     )
 
-    deliver_invoice(
-        db,
-        invoice,
+    if not invoice:
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_404_NOT_FOUND
+            ),
+            detail="Invoice not found.",
+        )
+
+    # ========================================================
+    # RESEND
+    # ========================================================
+
+    try:
+
+        deliver_invoice(
+            db=db,
+            invoice=invoice,
+        )
+
+    except ValueError as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_422_UNPROCESSABLE_ENTITY
+            ),
+            detail=str(exc),
+        ) from exc
+
+    except Exception as exc:
+
+        db.rollback()
+
+        logger.exception(
+            "Failed to resend invoice %s",
+            invoice.invoice_number,
+        )
+
+        raise HTTPException(
+            status_code=(
+                status.HTTP_500_INTERNAL_SERVER_ERROR
+            ),
+            detail=(
+                "Unable to resend invoice."
+            ),
+        ) from exc
+
+    db.refresh(
+        invoice
     )
 
-    db.refresh(invoice)
-
-    return invoice
+    return _invoice_to_output(
+        invoice
+    )
