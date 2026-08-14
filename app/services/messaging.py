@@ -126,7 +126,7 @@ def _invoice_message_body(
     for item in invoice.items:
 
         lines.append(
-            f"- {item.product_name} "
+            f"- {item.product_name or 'Item'} "
             f"#{item.item_number}: "
             f"₹{float(item.unit_price):,.2f}"
         )

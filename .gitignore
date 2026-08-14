@@ -12,3 +12,5 @@ uploads/
 .mypy_cache/
 dist/
 build/
+*.db
+test_uploads/

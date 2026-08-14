@@ -815,9 +815,9 @@ class InvoiceItem(Base):
         back_populates="items",
     )
 
-    product_name: Mapped[str] = mapped_column(
+    product_name: Mapped[str | None] = mapped_column(
         String(200),
-        nullable=False,
+        nullable=True,
     )
 
     item_number: Mapped[int] = mapped_column(
