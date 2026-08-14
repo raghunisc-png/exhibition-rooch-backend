@@ -106,7 +106,7 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.func.utcnow(),
+            server_default=sa.func.now(),
         ),
     )
 
@@ -241,14 +241,14 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.func.utcnow(),
+            server_default=sa.func.now(),
         ),
 
         sa.Column(
             "captured_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.func.utcnow(),
+            server_default=sa.func.now(),
         ),
 
         # ----------------------------------------------------
@@ -389,7 +389,7 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             nullable=False,
-            server_default=sa.func.utcnow(),
+            server_default=sa.func.now(),
         ),
     )
 

@@ -358,7 +358,7 @@ def _parse_captured_at(
 
     if value is None:
 
-        return datetime.utcnow()
+        return datetime.now()
 
     if isinstance(
         value,
@@ -378,7 +378,7 @@ def _parse_captured_at(
 
     except ValueError:
 
-        return datetime.utcnow()
+        return datetime.now()
 
 
 # ============================================================
