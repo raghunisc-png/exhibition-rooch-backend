@@ -197,7 +197,6 @@ class InvoiceItemCreate(BaseModel):
     item_number: int = Field(
         ...,
         ge=1,
-        le=5,
     )
 
     unit_price: Decimal = Field(

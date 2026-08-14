@@ -107,6 +107,8 @@ export $(grep -v '^#' .env | xargs)   # or use direnv / python-dotenv instead
 
 alembic upgrade head             # creates/updates all tables
 python -m app.create_admin "Jane Doe" jane@example.com "StrongPass123"
+python -m app.create_admin "Rooch Admin" admin@rooch.in "Rooch@123"
+
 
 uvicorn app.main:app --reload
 ```
