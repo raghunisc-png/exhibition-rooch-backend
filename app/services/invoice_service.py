@@ -450,23 +450,23 @@ def create_invoice_row(
                 )
 
             # ------------------------------------------------
-            # Product name
+            # Product name (optional)
             # ------------------------------------------------
 
-            product_name = str(
-                item_data.get(
-                    "product_name",
-                    "",
-                )
-            ).strip()
+            product_name_raw = item_data.get(
+                "product_name"
+            )
 
-            if not product_name:
+            product_name = (
+                str(product_name_raw).strip()
+                if product_name_raw is not None
+                else None
+            ) or None
 
-                raise ValueError(
-                    "Product name cannot be empty."
-                )
-
-            if len(product_name) > 200:
+            if (
+                product_name
+                and len(product_name) > 200
+            ):
 
                 raise ValueError(
                     "Product name cannot exceed "
@@ -512,7 +512,7 @@ def create_invoice_row(
 
                 raise ValueError(
                     f"Price is required for "
-                    f"{product_name} #{item_number}."
+                    f"{product_name or 'item'} #{item_number}."
                 )
 
             unit_price = _money(

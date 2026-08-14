@@ -1337,8 +1337,9 @@ def build_invoice_pdf_bytes(
         items
     ):
 
-        product_name = str(
+        product_name = (
             invoice_item.product_name
+            or "Item"
         )
 
         product_lines = _wrapped_lines(

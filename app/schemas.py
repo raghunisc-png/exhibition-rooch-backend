@@ -188,9 +188,8 @@ class InvoiceItemCreate(BaseModel):
         Necklace #1 -> ₹600
     """
 
-    product_name: str = Field(
-        ...,
-        min_length=1,
+    product_name: str | None = Field(
+        default=None,
         max_length=200,
     )
 
@@ -211,17 +210,15 @@ class InvoiceItemCreate(BaseModel):
     @classmethod
     def validate_product_name(
         cls,
-        value: str,
-    ) -> str:
+        value: str | None,
+    ) -> str | None:
+
+        if value is None:
+            return None
 
         value = value.strip()
 
-        if not value:
-            raise ValueError(
-                "Product name cannot be empty."
-            )
-
-        return value
+        return value or None
 
 
 # ============================================================
@@ -240,7 +237,7 @@ class InvoiceItemOut(BaseModel):
 
     id: int
 
-    product_name: str
+    product_name: str | None
 
     item_number: int
 
