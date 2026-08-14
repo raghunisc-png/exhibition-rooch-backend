@@ -372,7 +372,7 @@ def _parse_captured_at(
         return datetime.fromisoformat(
             str(value).replace(
                 "Z",
-                "+00:00",
+                "+05:30",
             )
         )
 

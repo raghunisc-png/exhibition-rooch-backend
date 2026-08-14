@@ -494,11 +494,19 @@ def create_invoice_row(
                     "Invalid item number."
                 ) from exc
 
-            if not 1 <= item_number <= 5:
+            # ------------------------------------------------
+            # IMPORTANT:
+            #
+            # Item numbers are no longer limited to 1-5.
+            #
+            # This allows the + button to create item #6,
+            # #7, #8, etc.
+            # ------------------------------------------------
+
+            if item_number < 1:
 
                 raise ValueError(
-                    "Item number must be between "
-                    "1 and 5."
+                    "Item number must be at least 1."
                 )
 
             # ------------------------------------------------
