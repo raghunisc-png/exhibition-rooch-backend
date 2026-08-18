@@ -262,26 +262,26 @@ def _parse_captured_at(
 
     if not value:
 
-        return datetime.utcnow()
+        return datetime.now()
 
     value = value.strip()
 
     if not value:
 
-        return datetime.utcnow()
+        return datetime.now()
 
     try:
 
         return datetime.fromisoformat(
             value.replace(
                 "Z",
-                "+00:00",
+                "+05:30",
             )
         )
 
     except ValueError:
 
-        return datetime.utcnow()
+        return datetime.now()
 
 
 # ============================================================
