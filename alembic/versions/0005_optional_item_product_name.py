@@ -2,8 +2,14 @@
 Make invoice_items.product_name optional.
 
 Revision ID: 0005
-Revises: 0004
+Revises: 0003
 Create Date: 2026-08-14
+
+0004_invoice_items_table.py has been removed. It assumed invoice_items
+didn't exist yet (true against an older local copy of 0001), but the
+actual 0001_initial.py already creates invoice_items with the full
+current schema - so 0004 was a redundant, conflicting CREATE TABLE that
+broke every fresh deploy.
 """
 
 from alembic import op
@@ -16,7 +22,7 @@ import sqlalchemy as sa
 
 revision = "0005"
 
-down_revision = "0004"
+down_revision = "0003"
 
 branch_labels = None
 
