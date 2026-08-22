@@ -31,7 +31,7 @@ def generate_invoice_number(
     """
 
     today_prefix = (
-        f"INV-{datetime.utcnow():%Y%m%d}-"
+        f"INV-{datetime.now():%Y%m%d}-"
     )
 
     count_today = (

@@ -262,13 +262,13 @@ def _parse_captured_at(
 
     if not value:
 
-        return datetime.utcnow()
+        return datetime.now()
 
     value = value.strip()
 
     if not value:
 
-        return datetime.utcnow()
+        return datetime.now()
 
     try:
 
@@ -281,7 +281,7 @@ def _parse_captured_at(
 
     except ValueError:
 
-        return datetime.utcnow()
+        return datetime.now()
 
 
 # ============================================================
